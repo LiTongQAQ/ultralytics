@@ -123,10 +123,19 @@ class TaskAlignedAssigner(nn.Module):
             fg_mask (torch.Tensor): Foreground mask with shape (bs, num_total_anchors).
             target_gt_idx (torch.Tensor): Target ground truth indices with shape (bs, num_total_anchors).
         """
+        # mask_pos shape is (bs, n_max_boxes, num_total_anchors), indicating whether each anchor point is a positive sample for each ground truth box through topk selection
+        # align_metric shape is (bs, n_max_boxes, num_total_anchors), indicating the task-aligned metric for each anchor point and each ground truth box
+        # overlaps shape is (bs, n_max_boxes, num_total_anchors), indicating the IoU between predicted boxes and ground truth boxes for each anchor point and each ground truth box
+        # mask_pos 形状为 (bs, n_max_boxes, num_total_anchors)，表示经过topk筛选后每个anchor点是否为每个GT框的正样本mask
+        # align_metric 形状为 (bs, n_max_boxes, num_total_anchors)，表示每个anchor点与每个GT框之间的任务对齐度量分数
+        # overlaps 形状为 (bs, n_max_boxes, num_total_anchors)，表示每个anchor点对应的预测框与GT框之间的IoU值
         mask_pos, align_metric, overlaps = self.get_pos_mask(
             pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt
         )
 
+        # target_gt_idx → 每个anchor cell归属哪个GT（去重后）
+        # fg_mask       → 正负样本mask（去重后，最大值为1）
+        # mask_pos      → 完整的正样本分配矩阵（去重后）
         target_gt_idx, fg_mask, mask_pos = self.select_highest_overlaps(
             mask_pos, overlaps, self.n_max_boxes, align_metric
         )
@@ -140,6 +149,11 @@ class TaskAlignedAssigner(nn.Module):
         pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)  # b, max_num_obj
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
         target_scores = target_scores * norm_align_metric
+        # 硬标签 target=1：
+        #   训练初期模型预测0.1 → loss很大 → 梯度爆炸 → 训练不稳定
+
+        # 软标签 target=0.3（早期）：
+        #   模型预测0.1 → loss适中 → 梯度合理 → 稳定训练
 
         return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
 
@@ -159,8 +173,11 @@ class TaskAlignedAssigner(nn.Module):
             align_metric (torch.Tensor): Alignment metric with shape (bs, max_num_obj, h*w).
             overlaps (torch.Tensor): Overlaps between predicted vs ground truth boxes with shape (bs, max_num_obj, h*w).
         """
+        # Shape is (b, max_num_obj, h*w), indicating whether each anchor point is a candidate for each ground truth box
         mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
-        # Get anchor_align metric, (b, max_num_obj, h*w)
+        # Get anchor_align metric, (b, max_num_obj, h*w), align_metric is the combination of classification score and localization score (IoU)
+        # overlaps is the IoU between predicted boxes and ground truth boxes, used for later selecting the best matching gt box for each anchor point
+        # There are based on the mask_in_gts, which means only the candidate anchor points for each gt box are considered in the calculation of align_metric and overlaps
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
         # Get topk_metric mask, (b, max_num_obj, h*w)
         mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
@@ -231,7 +248,7 @@ class TaskAlignedAssigner(nn.Module):
         topk_metrics, topk_idxs = torch.topk(metrics, self.topk, dim=-1, largest=True)
         if topk_mask is None:
             topk_mask = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
-        # (b, max_num_obj, topk)
+        # (b, max_num_obj, topk), set the positions that are not in the top-k set to 0
         topk_idxs.masked_fill_(~topk_mask, 0)
 
         # (b, max_num_obj, topk, h*w) -> (b, max_num_obj, h*w)
@@ -265,6 +282,8 @@ class TaskAlignedAssigner(nn.Module):
         # Assigned target labels, (b, 1)
         batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[..., None]
         target_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes  # (b, h*w)
+        # PyTorch 索引规则：结果形状 = 索引张量的形状, gt_labels 是索引表，target_gt_idx 是索引张量
+        # 结果形状为 (b, h*w)，每个位置的值是 gt_labels 中对应索引位置的值
         target_labels = gt_labels.long().flatten()[target_gt_idx]  # (b, h*w)
 
         # Assigned target boxes, (b, max_num_obj, 4) -> (b, h*w, 4)
@@ -305,15 +324,16 @@ class TaskAlignedAssigner(nn.Module):
         gt_bboxes_xywh = xyxy2xywh(gt_bboxes)
         wh_mask = gt_bboxes_xywh[..., 2:] < self.stride[0]  # the smallest stride
         gt_bboxes_xywh[..., 2:] = torch.where(
-            (wh_mask * mask_gt).bool(),
-            torch.tensor(self.stride_val, dtype=gt_bboxes_xywh.dtype, device=gt_bboxes_xywh.device),
-            gt_bboxes_xywh[..., 2:],
+            (wh_mask * mask_gt).bool(),     # Get the mask for boxes smaller than the smallest stride， shape=(b, n_boxes, 2)
+            torch.tensor(self.stride_val, dtype=gt_bboxes_xywh.dtype, device=gt_bboxes_xywh.device),    # Set the width and height to stride_val for boxes smaller than the smallest stride
+            gt_bboxes_xywh[..., 2:],        # Keep the original width and height for boxes larger than the smallest stride
         )
         gt_bboxes = xywh2xyxy(gt_bboxes_xywh)
 
         n_anchors = xy_centers.shape[0]
         bs, n_boxes, _ = gt_bboxes.shape
         lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom
+        # Calculate the distances from anchor centers to the left-top and right-bottom corners of the ground truth boxes, and reshape to (bs, n_boxes, n_anchors, 4)
         bbox_deltas = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=2).view(bs, n_boxes, n_anchors, -1)
         return bbox_deltas.amin(3).gt_(eps)
 
@@ -334,13 +354,14 @@ class TaskAlignedAssigner(nn.Module):
         # Convert (b, n_max_boxes, h*w) -> (b, h*w)
         fg_mask = mask_pos.sum(-2)
         if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes
+            # label fg_mask more than 1, which means one anchor is assigned to multiple gt_bboxes
             mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)  # (b, n_max_boxes, h*w)
-
+            # get the index of gt with the max IoU for each anchor, (b, h*w)
             max_overlaps_idx = overlaps.argmax(1)  # (b, h*w)
             is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
             is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
             mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()  # (b, n_max_boxes, h*w)
-
+                        #            ↑条件            ↑True时取        ↑False时取
             fg_mask = mask_pos.sum(-2)
 
         if self.topk2 != self.topk:
@@ -350,6 +371,11 @@ class TaskAlignedAssigner(nn.Module):
             topk_idx.scatter_(-1, max_overlaps_idx, 1.0)
             mask_pos *= topk_idx
             fg_mask = mask_pos.sum(-2)
+        # ① anchor中心在GT框内        (mask_in_gts)
+        # ② align_metric是topk之一    (mask_topk)
+        # ③ 是有效GT非padding         (mask_gt)
+        # ④ 跨GT冲突已解决，每个anchor最多归属一个GT
+
         # Find each grid serve which gt(index)
         target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
         return target_gt_idx, fg_mask, mask_pos
